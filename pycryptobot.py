@@ -1075,16 +1075,11 @@ def executeJob(
                         # _state.last_buy_size = float(account.getBalance(_app.getQuoteCurrency()))
                         _state.last_buy_size = float(account.quotebalance)
 
-                        if (
-                            _app.getBuyMaxSize()
-                            and _state.last_buy_size > _app.getBuyMaxSize()
-                        ):
+                        if _app.getBuyMaxSize() and _state.last_buy_size > _app.getBuyMaxSize():
                             _state.last_buy_size = _app.getBuyMaxSize()
 
-                        resp = _app.marketBuy(
-                            _app.getMarket(), _state.last_buy_size, _app.getBuyPercent()
-                        )
-                        if not resp.empty:
+                        try:
+                            _app.marketBuy(_app.getMarket(), _state.last_buy_size, _app.getBuyPercent())
                             now = datetime.today().strftime("%Y-%m-%d %H:%M:%S")
                             _app.notifyTelegram(
                                 _app.getMarket()
@@ -1115,7 +1110,7 @@ def executeJob(
                             )
 
                             state.last_api_call_datetime -= timedelta(seconds=60)
-                        else:
+                        except:
                             Logger.warning("Unable to place order")
                     else:
                         Logger.warning("Unable to place order, insufficient funds")
