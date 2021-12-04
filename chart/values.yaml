@@ -9,7 +9,7 @@ image:
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
   tag: "latest"
-
+command: []
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -22,7 +22,7 @@ serviceAccount:
   # The name of the service account to use.
   # If not set and create is true, a name is generated using the fullname template
   name: ""
-
+annotations: {}
 podAnnotations: {}
 
 podSecurityContext: {}
@@ -48,12 +48,23 @@ resources: {}
   #   cpu: 100m
   #   memory: 128Mi
 
+extraVolumeMounts: []
+extraVolumes: []
+telegramBot:
+  persistence:
+    enabled: false
+    accessMode: ReadWriteOnce
+    existingClaimName:
+    size: 1Gi
+
 nodeSelector: {}
 
 tolerations: []
 
 affinity: {}
 
+existingConfig:
+existingSecret:
 config: >
   {
       "api_url" : "https://api.pro.coinbase.com",
@@ -63,6 +74,15 @@ config: >
           "fiatMarket" : "GBP",
           "live" : 1,
           "sellatloss" : 0
+      }
+  }
+scanner: >
+  {
+      "coinbasepro" : {
+          "quote_currency": ["GBP"]
+      },
+      "binance" : {
+          "quote_currency": ["USDT"]
       }
   }
 
@@ -79,3 +99,8 @@ kucoin_key: |
   0000000000000000000000000000000000000000000000000000000000000000
   0000000000000000000000000000000000000000000000000000000000000000
   0000000000000000000000000000000000000000000000000000000000000000
+  
+
+operatorDefaults:
+useK8SOperator: false
+isJob: false

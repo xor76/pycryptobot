@@ -15,7 +15,15 @@ import subprocess
 import platform
 import re
 import urllib.request
+from json import JSONDecodeError
+from sched import scheduler
 
+import yaml
+from kubernetes import config, dynamic
+from kubernetes.client import api_client
+from kubernetes.dynamic import DynamicClient
+from kubernetes.dynamic.exceptions import ApiException, NotFoundError
+from kubernetes.watch import watch
 from datetime import datetime
 from time import sleep, time
 # from pandas.core.frame import DataFrame
@@ -52,7 +60,6 @@ EXCEPT_EXCHANGE, EXCEPT_MARKET = range(2)
 reply_keyboard = [["Coinbase Pro", "Binance", "Kucoin"]]
 
 markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-
 
 class TelegramBotBase:
     """
@@ -159,6 +166,8 @@ class TelegramBot(TelegramBotBase):
     """
 
     def __init__(self):
+        self.k8s_client: DynamicClient = None
+        self.restart_on_init = False
         self.token = ""
         self.config_file = ""
 
@@ -183,10 +192,35 @@ class TelegramBot(TelegramBotBase):
             help="Use the datafolder at the given location, useful for multi bots running in different folders",
             default="",
         )
+        parser.add_argument(
+            "--restart-on-init",
+            action="store_true",
+            help="Restart all pycryptobots on starting Telegram bot",
+            default=False,
+        )
+        parser.add_argument(
+            "--use-k8s-operator",
+            action="store_true",
+            help="Use K8S operator instead of using subprocesses",
+            default=False,
+        )
 
         args = parser.parse_args()
 
         self.config_file = args.config_file
+        self.restart_on_init = args.restart_on_init
+        if args.use_k8s_operator:
+            try:
+                k8s_config = config.load_incluster_config()
+            except:
+                k8s_config = config.load_kube_config()
+
+            client = dynamic.DynamicClient(
+                api_client.ApiClient(configuration=k8s_config)
+            )
+            self.k8s_client = client.resources.get(
+                api_version="charts.pycryptobot.org/v1alpha1", kind="PyCryptoBot"
+            )
 
         with open(os.path.join(self.config_file), "r", encoding="utf8") as json_file:
             self.config = json.load(json_file)
@@ -355,6 +389,46 @@ class TelegramBot(TelegramBotBase):
         self.pair = update.message.text
 
         return True
+
+    def _start_process(self, pair, process: str):
+        if self.k8s_client:
+            with open("operator.defaults.yaml", "r") as stream:
+                name = pair.lower()
+                try:
+                    pycryptobot_config = yaml.safe_load(stream)
+                    pycryptobot_config["apiVersion"] = self.k8s_client.group_version
+                    pycryptobot_config["kind"] = self.k8s_client.kind
+                    pycryptobot_config["spec"]["command"] = ["bash", "-c", process]
+                    pycryptobot_config["spec"]["isJob"] = True
+                    pycryptobot_config["spec"]["annotations"] = {
+                        "bot/updated": f"\"{datetime.now()}\""
+                    }
+                    pycryptobot_config["metadata"]["name"] = name
+
+                    self.k8s_client.create(body=pycryptobot_config, force_conflicts=True)
+
+                except yaml.YAMLError as exc:
+                    print(exc)
+                except ApiException:
+                    try:
+                        while True:
+                            self.k8s_client.delete(name=name, namespace=pycryptobot_config["metadata"]["namespace"])
+                            sleep(5)
+
+                    except NotFoundError:
+                        self.k8s_client.create(
+                            body=pycryptobot_config
+                        )
+                    except ApiException as e:
+                        print(e)
+        elif platform.system() == "Windows":
+            os.system(
+                f"start powershell -Command $host.UI.RawUI.WindowTitle = '{pair}' ; {process}"
+            )
+        else:
+            subprocess.Popen(
+                process, shell=True
+            )
 
     def responses(self, update, context):
 
@@ -895,6 +969,46 @@ class TelegramBot(TelegramBotBase):
                     parse_mode="HTML",
                 )
 
+    def startallbotsoninit(self) -> None:
+        jsonfiles = os.listdir(os.path.join(self.datafolder, "telegram_data"))
+        data = self.data
+        mBot = Telegram(self.token, client_id=self.config['telegram']['client_id'])
+        mBot.send("Starting telegram bot")
+        for file in jsonfiles:
+            if (
+                    ".json" in file
+                    and not file == "data.json"
+                    and not file.__contains__("output.json")
+            ):
+                try:
+                    broken_config = False
+                    try:
+                        self._read_data(file)
+                    except JSONDecodeError:
+                        broken_config = True
+                    if broken_config or ('botcontrol' in self.data
+                                         and 'status' in self.data["botcontrol"]
+                                         and self.data["botcontrol"]["status"] == "active"):
+                        pair = file[:-5]
+                        overrides = data["markets"][pair]["overrides"] if 'markets' in data \
+                                                                          and pair in data["markets"] \
+                                                                          and 'overrides' in data["markets"][pair] \
+                            else f"--startmethod scanner --exchange {self.data['exchange']} --market {pair}"
+                        done = False
+                        retries = 0
+                        while not done and retries < 10:
+                            try:
+                                self._start_process(pair, f"python3 pycryptobot.py --startmethod telegram {overrides}")
+                                mBot.send(f"<i>Starting {pair} crypto bot</i>", parsemode="HTML")
+                                done = True
+                            except Exception as e:
+                                print(repr(e))
+                                retries += 1
+                            finally:
+                                sleep(10)
+                except Exception as e:
+                    print(f"Issue with {file}: {repr(e)}")
+
     def startallbotsrequest(self, update, context) -> None:
         """Ask which bot to start from start list (or all)"""
         if not self._checkifallowed(context._user_id_and_data[0], update):
@@ -953,14 +1067,7 @@ class TelegramBot(TelegramBotBase):
                     os.path.join(self.datafolder, "telegram_data", pair + ".json")
                 ):
                     overrides = self.data["markets"][pair]["overrides"]
-                    if platform.system() == "Windows":
-                        os.system(
-                            f"start powershell -Command $host.UI.RawUI.WindowTitle = '{pair}' ; python3 pycryptobot.py --startmethod telegram {overrides}"
-                        )
-                    else:
-                        subprocess.Popen(
-                            f"python3 pycryptobot.py --startmethod telegram {overrides}", shell=True
-                        )
+                    self._start_process(pair, f"python3 pycryptobot.py --startmethod telegram {overrides}")
                     mBot = Telegram(self.token, str(context._chat_id_and_data[0]))
                     mBot.send(f"<i>Starting {pair} crypto bot</i>", parsemode="HTML")
                     sleep(10)
@@ -968,13 +1075,8 @@ class TelegramBot(TelegramBotBase):
             overrides = self.data["markets"][str(query.data).replace("start_", "")][
                 "overrides"
             ]
-            if platform.system() == "Windows":
-                os.system(
-                    f"start powershell -Command $host.UI.RawUI.WindowTitle = '{query.data.replace('start_', '')}' ; python3 pycryptobot.py --startmethod telegram {overrides}"
-                )
-                # os.system(f"start powershell -NoExit -Command $host.UI.RawUI.WindowTitle = '{query.data.replace('start_', '')}' ; python3 pycryptobot.py {overrides}")
-            else:
-                subprocess.Popen(f"python3 pycryptobot.py --startmethod telegram {overrides}", shell=True)
+            self._start_process(query.data.replace('start_', ''),
+                                f"python3 pycryptobot.py --startmethod telegram {overrides}")
             query.edit_message_text(
                 f"<i>Starting {str(query.data).replace('start_', '')} crypto bots</i>",
                 parse_mode="HTML",
@@ -1173,30 +1275,14 @@ class TelegramBot(TelegramBotBase):
             
             return False
 
-        def StartWindowsProcess() -> None:
-            # subprocess.Popen(f"python3 pycryptobot.py {overrides}", creationflags=subprocess.CREATE_NEW_CONSOLE)
-            os.system(
-                    f"start powershell -Command $host.UI.RawUI.WindowTitle = '{self.pair}' ; "
-                    f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} --logfile './logs/{self.exchange}-{self.pair}-{datetime.now().date()}.log' {self.overrides}"
-                )
-
-        def StartLinuxProcess() -> None:
-            subprocess.Popen(
-                    f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} {self.overrides}",
-                    shell=True,
-                )
-
         if update.message.text == "Auto_Yes":
             if IsBotRunning():
                 update.message.reply_text(
                     "Bot is already running, no action taken.",
                     reply_markup=ReplyKeyboardRemove())
                 return None
-
-            if platform.system() == "Windows":
-                StartWindowsProcess()
-            else:
-                StartLinuxProcess()
+            self._start_process(self.pair,
+                                f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} --logfile './logs/{self.exchange}-{self.pair}-{datetime.now().date()}.log' {self.overrides}")
 
         if update.message.text == "Yes":
 
@@ -1206,12 +1292,9 @@ class TelegramBot(TelegramBotBase):
                     reply_markup=ReplyKeyboardRemove())
                 return None
 
-            if platform.system() == "Windows":
-                StartWindowsProcess()
-                update.message.reply_text(f"{self.pair} crypto bot Starting", reply_markup=ReplyKeyboardRemove())
-            else:
-                StartLinuxProcess()
-                update.message.reply_text(f"{self.pair} crypto bot Starting",reply_markup=ReplyKeyboardRemove())
+            self._start_process(self.pair,
+                                f"python3 pycryptobot.py --startmethod {startmethod} --exchange {self.exchange} --market {self.pair} {self.overrides}")
+            update.message.reply_text(f"{self.pair} crypto bot Starting", reply_markup=ReplyKeyboardRemove())
 
             update.message.reply_text(
                 "Command Complete, have a nice day.", reply_markup=ReplyKeyboardRemove()
@@ -1232,7 +1315,7 @@ class TelegramBot(TelegramBotBase):
     def error(self, update, context):
         """Log Errors"""
         if len(context.error.args) > 0 or "message" in context.error:
-            if "HTTPError" in context.error.args[0]: # if "HTTPError" in context.error[0] or 
+            if "HTTPError" in context.error.args[0]:  # if "HTTPError" in context.error[0] or
                 while self.checkconnection() == False:
                     logger.warning("No internet connection found")
                     self.updater.start_polling(poll_interval=30)
@@ -1335,6 +1418,7 @@ class TelegramBot(TelegramBotBase):
             )
             return
         # subprocess.Popen("python3 scanner.py", shell=True)
+        running_bots = 0
         if debug == False:
             if scanmarkets:
                 update.message.reply_text(
@@ -1355,9 +1439,12 @@ class TelegramBot(TelegramBotBase):
                     if "margin" in self.data and self.data["margin"] == " ":
                         if self.updatebotcontrol(file, "exit"):
                             sleep(5)
-        
+                        else:
+                            running_bots += 1
         self._read_data()
-        botcounter = 0
+        non_scanner_bots = len(self.data["markets"]) if "markets" not in self.data else 0
+        botcounter = running_bots - non_scanner_bots if running_bots > non_scanner_bots else 0
+
         for ex in config:
             for quote in config[ex]["quote_currency"]:
                 update.message.reply_text(f"Starting {ex} ({quote}) bots...", parse_mode="HTML")
@@ -1585,7 +1672,8 @@ def main():
 
     # Get the dispatcher to register handlers
     dp = botconfig.updater.dispatcher
-
+    if botconfig.restart_on_init:
+        dp.run_async(botconfig.startallbotsoninit)
     # Information commands
     dp.add_handler(CommandHandler("help", botconfig.help))
     dp.add_handler(CommandHandler("margins", botconfig.marginrequest, Filters.all))
