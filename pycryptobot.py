@@ -58,8 +58,8 @@ def executeJob(
     _state: AppState = None,
     _technical_analysis=None,
     _websocket=None,
-    trading_data=pd.DataFrame(),
-):
+    trading_data=pd.DataFrame(),):
+    
     """Trading bot job which runs at a scheduled interval"""
 
     # This is used to control some API calls when using websockets
